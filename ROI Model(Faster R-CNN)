@@ -1,0 +1,103 @@
+import os
+import torch
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms
+import torchvision
+from PIL import Image
+
+
+class CustomDataset(Dataset):
+    def __init__(self, root_dir, label_file, transform=None, file_extension='.png'):
+        self.root_dir = root_dir
+        self.transform = transform
+        self.file_extension = file_extension  # Ensure this attribute is set
+        self.annotations = []
+
+        with open(label_file, 'r', encoding='utf-8') as file:
+            lines = file.readlines()
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue  # Skip empty lines
+                parts = line.split('：')  # Handle full-width colon
+                if len(parts) != 2:
+                    print(f"Warning: Skipping malformed line: {line}")
+                    continue
+
+                image_file = parts[0].strip() + self.file_extension  # Ensure extension is added
+                try:
+                    bbox = list(map(int, parts[1].strip().split(',')))
+                    if len(bbox) != 4:
+                        print(f"Warning: Skipping line with incorrect bbox: {line}")
+                        continue
+                    self.annotations.append((image_file, bbox))
+                except ValueError:
+                    print(f"Warning: Skipping line with non-integer values: {line}")
+                    continue
+
+    def __len__(self):
+        return len(self.annotations)
+
+    def __getitem__(self, idx):
+        img_name, bbox = self.annotations[idx]
+        img_path = os.path.join(self.root_dir, img_name)
+        image = Image.open(img_path).convert("L")  # Convert image to grayscale
+
+        boxes = torch.tensor([bbox], dtype=torch.float32)
+        labels = torch.tensor([1], dtype=torch.int64)  # Assuming single class
+
+        target = {"boxes": boxes, "labels": labels}
+
+        if self.transform:
+            image = self.transform(image)
+
+        return image, target
+
+# Define transformations
+transform = transforms.Compose([
+    transforms.Resize((448, 448)),
+    transforms.ToTensor(),
+])
+
+# Prepare dataset and dataloader
+dataset = CustomDataset(root_dir=r'put-your-path-of-data', label_file=r'ROI.txt', transform=transform)
+dataloader = DataLoader(dataset, batch_size=4, shuffle=True, collate_fn=lambda x: tuple(zip(*x)))
+
+import ssl
+ssl._create_default_https_context = ssl._create_unverified_context
+
+# Initialize the model
+model = torchvision.models.detection.fasterrcnn_resnet50_fpn(pretrained=True)
+
+# Modify the model to work with single class (plus background)
+num_classes = 2  # 1 class + background
+in_features = model.roi_heads.box_predictor.cls_score.in_features
+model.roi_heads.box_predictor = torchvision.models.detection.faster_rcnn.FastRCNNPredictor(in_features, num_classes)
+
+# Training setup
+device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+model.to(device)
+
+# Optimizer
+params = [p for p in model.parameters() if p.requires_grad]
+optimizer = torch.optim.SGD(params, lr=0.005, momentum=0.9, weight_decay=0.0005)
+
+# Training loop
+num_epochs = 30
+for epoch in range(num_epochs):
+    model.train()
+    for images, targets in dataloader:
+        images = list(image.to(device) for image in images)
+        targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+
+        loss_dict = model(images, targets)
+        losses = sum(loss for loss in loss_dict.values())
+
+        optimizer.zero_grad()
+        losses.backward()
+        optimizer.step()
+
+    print(f"Epoch: {epoch}, Loss: {losses.item()}")
+
+# Save the model
+torch.save(model.state_dict(), 'best-model.pth')
